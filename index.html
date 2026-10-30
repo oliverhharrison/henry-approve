@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Henry approvals</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; font: 17px system-ui, sans-serif;
+         background: var(--tg-theme-bg-color, #fff); color: var(--tg-theme-text-color, #111); }
+  main { padding: 24px; text-align: center; }
+</style>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+<main><p id="msg">Opening Face ID...</p></main>
+<!-- Pure helpers: appsscript/test/faceid_page.test.js loads exactly this block. No secrets live on this page. -->
+<script id="core">
+const enc = new TextEncoder();
+const toHex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+const approveMessage = (card, nonce) => "approve|" + card + "|" + nonce;
+async function hmacHex(key, msg) {
+  const k = await crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return toHex(await crypto.subtle.sign("HMAC", k, enc.encode(msg)));
+}
+function parseHash(hash) {
+  const raw = String(hash || "").replace(/^#/, "");
+  const p = new URLSearchParams(raw);
+  return { mode: raw.split("&")[0], c: p.get("c") || "", n: p.get("n") || "" };
+}
+</script>
+<script id="flow">
+const tg = window.Telegram && window.Telegram.WebApp;
+const bm = tg && tg.BiometricManager;
+const say = (t) => { document.getElementById("msg").textContent = t; };
+const ask = (fn) => new Promise((resolve) => fn(resolve));
+function finish(text, ms) { say(text); setTimeout(() => tg.close(), ms); }
+
+async function ready() {                       // true when Face ID can be used, else tells the user and closes
+  await ask((cb) => bm.init(cb));
+  if (!bm.isBiometricAvailable) { finish("Face ID isn't available here - use your PIN", 2000); return false; }
+  if (!bm.isAccessGranted) {
+    const ok = await ask((cb) => bm.requestAccess({ reason: "Henry uses Face ID to confirm approvals" }, cb));
+    if (!ok) { finish("Face ID access was not granted - use your PIN", 2000); return false; }
+  }
+  return true;
+}
+const unlock = (reason) => ask((cb) => bm.authenticate({ reason }, (ok, token) => cb(ok ? token : null)));
+
+async function enroll(nonce) {
+  if (!(await ready())) return;
+  const token = toHex(crypto.getRandomValues(new Uint8Array(32)));
+  if (!(await ask((cb) => bm.updateBiometricToken(token, cb)))) return finish("Could not save the key - use your PIN", 2000);
+  if ((await unlock("Confirm Face ID for Henry")) !== token) return finish("Face ID check failed - nothing was set up", 2500);
+  tg.sendData(JSON.stringify({ m: "enroll", n: nonce, t: token }));   // the only time the token leaves the phone
+  finish("Done", 800);
+}
+
+async function approve(card, nonce) {
+  if (!(await ready())) return;
+  if (!bm.isBiometricTokenSaved) return finish("Face ID isn't set up on this phone - use your PIN", 2500);
+  const token = await unlock("Approve " + card);
+  if (!token) return finish("Cancelled - nothing sent", 1200);
+  const mac = await hmacHex(token, approveMessage(card, nonce));      // the token itself is never sent
+  tg.sendData(JSON.stringify({ m: "approve", c: card, n: nonce, mac }));
+  finish("Sent", 800);
+}
+
+if (tg && bm) {
+  tg.ready();
+  const h = parseHash(location.hash);
+  if (h.mode === "enroll" && h.n) enroll(h.n);
+  else if (h.mode === "approve" && h.c && h.n) approve(h.c, h.n);
+  else say("Nothing to do here.");
+} else {
+  say("Open this page from Henry in Telegram.");
+}
+</script>
+</body>
+</html>
